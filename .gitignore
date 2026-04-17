@@ -1,2 +1,11 @@
 .DS_Store
 esp32-firmware/include/config.h
+
+# Python / server
+mac-server/.venv/
+mac-server/.env
+mac-server/__pycache__/
+mac-server/*.pyc
+
+# Debug audio dumps from /api/voice
+mac-server/debug_audio/

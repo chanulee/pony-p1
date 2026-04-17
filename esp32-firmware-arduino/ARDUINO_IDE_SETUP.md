@@ -65,10 +65,16 @@ Open `pony_p1_network_test/config.h` and update:
 #define SERVER_HOST   "192.168.1.xxx"  // Your Mac Studio's IP
 ```
 
-To find your Mac Studio's IP:
+To find your Mac Studio's IP (the Wi-Fi interface isn't always `en0` — on Mac Studio it's often `en1`):
 ```bash
+# Try each interface until one prints an address:
 ipconfig getifaddr en0
+ipconfig getifaddr en1
+
+# Or list every interface that has an IPv4 address:
+for i in $(ifconfig -l); do a=$(ipconfig getifaddr "$i" 2>/dev/null); [ -n "$a" ] && echo "$i: $a"; done
 ```
+You can also check **System Settings > Network > (Wi‑Fi) > Details** — the "IP address" field is what you want.
 
 ## 6. Open and Upload
 
@@ -79,12 +85,99 @@ ipconfig getifaddr en0
 
 ## 7. Start the Mac Server
 
-On your Mac Studio, in a separate terminal:
+On your Mac Studio, in a separate terminal. Homebrew's Python is externally-managed, so use a virtual environment (and note that the commands are `python3` / `pip3`, not `python` / `pip`):
+
 ```bash
 cd mac-server
-pip install -r requirements.txt
-python server.py
+
+# First time only: create and populate a venv
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install -r requirements.txt
+
+# Every time after that:
+source .venv/bin/activate
+python3 server.py
 ```
+
+If you see `zsh: command not found: pip`, you either forgot to activate the venv or you're using `pip` instead of `pip3`. If you see `error: externally-managed-environment`, you're running `pip3` outside the venv — activate it first with `source .venv/bin/activate`.
+
+## Phase 2: Push-to-Talk Voice (SPH0645 + Whisper + Ollama)
+
+Hold the BOOT button to record, release to send. The Mac transcribes with `faster-whisper`, feeds the transcript to Ollama, and the answer appears on the TFT.
+
+### Mic wiring (GY‑SPH0645 → T7‑S3)
+
+| SPH0645 pin | ESP32-S3 GPIO | Notes |
+|-------------|---------------|-------|
+| 3V          | 3V3           | power |
+| GND         | GND           | ground |
+| SEL         | _unconnected_ | leaves the mic on the LEFT channel (default) |
+| BCLK        | GPIO 4        | I2S bit clock |
+| DOUT        | GPIO 5        | I2S data out (mic -> ESP32) |
+| LRCL        | GPIO 6        | I2S word-select (WS) |
+
+Pin numbers live in `pony_p1_network_test/config.h` — change there if you re‑wire.
+
+### Mac-side prereqs
+
+The first run will download the Whisper model (`base.en`, ~150 MB) into `~/.cache/huggingface`.
+
+```bash
+cd mac-server
+source .venv/bin/activate
+pip3 install -r requirements.txt   # installs faster-whisper + numpy
+python3 server.py
+```
+
+You should see the server log:
+```
+Loading faster-whisper 'base.en' (cpu/int8)...
+Whisper loaded in X.Xs
+...
+  POST /api/voice  (WAV -> Whisper -> Ollama)
+```
+
+### Using it
+
+1. Re‑flash the ESP32 (ino has changed: I2S capture + `/api/voice`).
+2. After boot, the TFT shows `Ready / Hold BOOT to talk`.
+3. **Press and hold** the BOOT button while speaking (red `REC` indicator with a running timer appears).
+4. **Release** to upload. TFT shows `Uploading...` → `Thinking... / STT + LLM`.
+5. Answer appears on the TFT; Serial Monitor and the server terminal show the transcript + timings.
+
+Max recording is **10 s** per hold (`MAX_SECONDS` in the `.ino`). The audio buffer lives in PSRAM, so make sure **PSRAM: OPI PSRAM** is set in the Tools menu.
+
+### Troubleshooting voice
+
+- **"Mic FAIL / Check wiring"** at boot: I2S didn't start. Verify BCLK/DOUT/LRCL match your wiring and that VDD is 3V3 (not 5V).
+- **All silence or constant noise in transcript**: check that SEL is not tied HIGH (that would put the mic on the RIGHT slot while we read LEFT).
+- **Recording is quiet**: bump `SPH0645_SHIFT` down (e.g. 10 instead of 11) in the `.ino`. Too loud / clipping: raise it (e.g. 12‑14). We clamp to int16 so clipping is hard-limited, not wrapping.
+- **Whisper says nothing**: server prints `Whisper: ...s -> ''`. Try speaking louder or closer, or lengthen the recording.
+- **First voice request is slow**: first `/api/voice` triggers Whisper compilation + Ollama model load; later requests are much faster.
+- **"No PSRAM?" on screen**: set **Tools > PSRAM** to `OPI PSRAM` and re‑flash; without PSRAM we can't hold 10 s of 16 kHz audio.
+
+## Phase 1.5: LLM Round-Trip (Ollama)
+
+The firmware now POSTs a `prompt` to `/api/llm`, the Mac server forwards it to a local Ollama model, and the response is shown on the TFT.
+
+Prereqs on the Mac Studio:
+
+```bash
+# Install Ollama from https://ollama.com if you haven't
+ollama serve &              # usually already running as a background service
+ollama pull gemma4:e4b      # (or edit OLLAMA_MODEL in server.py to a model you have)
+```
+
+Quick sanity check that Ollama is reachable:
+
+```bash
+curl -s http://localhost:11434/api/tags | head
+```
+
+Then start the Pony P1 server as in step 7 and press the BOOT button on the ESP32. The display should flash "Thinking..." for a few seconds, then show the model's answer. Each BOOT press cycles through a few preset prompts (see `PROMPTS[]` in the `.ino`).
+
+If a request times out, either the model is slow to load on the first run (the first generate can take 10–30 s while the model is loaded into RAM) or the HTTP read timeout in the firmware needs to go higher — adjust `http.setTimeout(120000)` in `sendLLMRequest()`.
 
 ## What You Should See
 
