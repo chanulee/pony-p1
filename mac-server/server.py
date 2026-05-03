@@ -4,14 +4,13 @@ Pony P1 Mac server.
 Endpoints:
   GET  /health      -> liveness probe
   POST /api/test    -> echo test
-  POST /api/llm     -> text prompt -> Ollama
-  POST /api/voice   -> WAV upload -> STT (Mistral Voxtral or local Whisper) -> Ollama
+  POST /api/stt     -> WAV upload -> transcript only
+  POST /api/llm     -> text prompt -> Ollama agent (with filesystem/vision tools)
+  POST /api/voice   -> WAV upload -> STT -> Ollama agent
 
-Config (put in mac-server/.env, see .env.example):
-  STT_BACKEND           "mistral" (default) or "whisper"
-  MISTRAL_API_KEY       required for STT_BACKEND=mistral
-  MISTRAL_STT_MODEL     default "voxtral-mini-latest"
-  OLLAMA_MODEL          default "gemma4:e4b"
+Agent details live in agent.py. Config (put in mac-server/.env, see .env.example):
+  STT_BACKEND, MISTRAL_API_KEY, MISTRAL_STT_MODEL,
+  OLLAMA_MODEL, OLLAMA_VISION_MODEL, AGENT_ROOT
 
 Run (from mac-server/ with venv active):
     pip3 install -r requirements.txt
@@ -34,12 +33,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
-load_dotenv()  # read mac-server/.env if present
+load_dotenv()  # read mac-server/.env if present BEFORE importing agent (it reads env too)
+
+import agent  # noqa: E402
 
 
 # ── Config ──────────────────────────────────────────────────
-OLLAMA_URL   = "http://localhost:11434"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+OLLAMA_URL   = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 
 STT_BACKEND       = os.getenv("STT_BACKEND", "mistral").lower()  # "mistral" or "whisper"
 MISTRAL_API_KEY   = os.getenv("MISTRAL_API_KEY", "").strip()
@@ -226,21 +227,23 @@ async def llm_endpoint(req: LLMRequest):
     print(f"\n--- /api/llm #{req.request_id} ---")
     print(f"  Prompt: {req.prompt}")
     try:
-        text, elapsed = await call_ollama(req.prompt)
+        text, trace, elapsed = await agent.run_agent(req.prompt)
     except Exception as e:
-        print(f"  Ollama error: {e}")
+        print(f"  Agent error: {e}")
         return {
             "status": "error",
             "display_text": f"LLM error:\n{str(e)[:240]}",
             "request_id": req.request_id,
         }
-    print(f"  Ollama OK in {elapsed:.1f}s ({len(text)} chars)")
+    print(f"  Agent done in {elapsed:.1f}s, {len(trace)} tool calls, {len(text)} chars")
     return {
         "status": "ok",
         "display_text": _truncate(text),
         "request_id": req.request_id,
         "elapsed_s": round(elapsed, 2),
         "model": OLLAMA_MODEL,
+        "tool_calls": len(trace),
+        "tools_used": [t["tool"] for t in trace],
     }
 
 
@@ -410,18 +413,18 @@ async def voice_endpoint(request: Request):
             "dbfs": round(dbfs, 1),
         }
 
-    # 3) LLM
+    # 3) Agent (LLM + tools)
     try:
-        answer, llm_elapsed = await call_ollama(transcript)
+        answer, trace, llm_elapsed = await agent.run_agent(transcript)
     except Exception as e:
-        print(f"  Ollama error: {e}")
+        print(f"  Agent error: {e}")
         return {
             "status": "error",
             "transcript": transcript,
             "display_text": f"You: {transcript}\n\nLLM error:\n{str(e)[:160]}",
             "request_id": request_id,
         }
-    print(f"  Ollama in {llm_elapsed:.1f}s ({len(answer)} chars)")
+    print(f"  Agent done in {llm_elapsed:.1f}s, {len(trace)} tool calls, {len(answer)} chars")
 
     return {
         "status": "ok",
@@ -436,6 +439,8 @@ async def voice_endpoint(request: Request):
         "dbfs": round(dbfs, 1),
         "stt_backend": STT_BACKEND,
         "model": OLLAMA_MODEL,
+        "tool_calls": len(trace),
+        "tools_used": [t["tool"] for t in trace],
     }
 
 
@@ -443,9 +448,14 @@ if __name__ == "__main__":
     print("\n=== Pony P1 Server ===")
     print("Listening on 0.0.0.0:8080")
     print("  POST /api/test   (echo)")
-    print("  POST /api/llm    (text -> Ollama)")
-    print("  POST /api/voice  (WAV -> STT -> Ollama)")
-    print(f"LLM model: {OLLAMA_MODEL} via {OLLAMA_URL}")
-    print(f"STT backend: {STT_BACKEND}")
+    print("  POST /api/stt    (WAV -> transcript)")
+    print("  POST /api/llm    (text -> agent)")
+    print("  POST /api/voice  (WAV -> STT -> agent)")
+    print(f"LLM model:    {OLLAMA_MODEL} via {OLLAMA_URL}")
+    print(f"Vision model: {agent.OLLAMA_VISION_MODEL}")
+    print(f"STT backend:  {STT_BACKEND}")
+    print(f"Agent sandbox: {agent.AGENT_ROOT}")
     print(f"Debug audio dir: {DEBUG_AUDIO_DIR}\n")
+    # Make sure the sandbox exists before the first request.
+    agent._ensure_sandbox()
     uvicorn.run(app, host="0.0.0.0", port=8080)
